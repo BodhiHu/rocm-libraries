@@ -17,6 +17,9 @@
 #pragma clang diagnostic ignored "-Wlifetime-safety-intra-tu-suggestions"
 namespace ck {
 
+/** @bodhi:
+ * BlockSize: number of threads in one Block
+ */
 template <index_t BlockSize,
           index_t MPerBlock,
           index_t NPerBlock,
@@ -164,6 +167,10 @@ struct BlockwiseGemmXdlops_pipeline_v4
 
         return threadid_to_wave_idx_adaptor.CalculateBottomIndex(make_multi_index(thread_id));
     }
+
+    /** @bodhi:
+     * CalculateXXThreadOriginDataIndex: thread 视野的 data index
+     */
 
     __device__ static auto CalculateAThreadOriginDataIndex()
     {
@@ -372,6 +379,44 @@ struct BlockwiseGemmXdlops_pipeline_v4
             c_grid_desc_g_m0_n0_m1_n1_m2_n2);
     }
 
+    /** @bodhi:
+     * __builtin_amdgcn_sched_group_barrier:
+     * 
+     * The first parameter is a mask that determines the types of instructions that
+     * you would like to synchronize around and add to a scheduling group.
+     * The second parameter is the number of matching instructions that will be associated with this sched_group_barrier.
+     * The third parameter is an identifier which is used to describe what other
+     * sched_group_barriers should be synchronized with.
+     * 
+     * This intrinsic combines multiple sched_group_barrier intrinsics enables an ordering of specific instruction types during instruction scheduling. For example, the following enforces a sequence of 1 VMEM read, followed by 1 VALU instruction, followed by 5 MFMA instructions:
+     * ```
+     *    // 1 VMEM read
+     *    sched_group_barrier::<32, 1, 0>()
+     *    // 1 VALU
+     *    sched_group_barrier::<2, 1, 0>()
+     *    // 5 MFMA
+     *    sched_group_barrier::<8, 5, 0>()
+     * ```
+     * 
+     * 和 s_waitcnt 的区别:
+     *     s_waitcnt       : 等待 memory 完成（数据依赖）
+     *     s_sched_barrier : 控制指令发射顺序
+     * 
+     * HotLoopScheduler:
+     * 
+     * 1. 把整个 hot loop 切成 num_buffer_load_inst 个“调度周期”,
+     * 每个 “调度周期” 构建一条理想的 memory/compute interleave 指令 pipeline:
+     *   MFMA
+     *   LDS read to VGPR/AGPR
+     *   MFMA
+     *   LDS write from AGPR
+     *   MFMA
+     *   VMEM load (global -> LDS)
+     *   MFMA MFMA MFMA ...
+     *
+     * 1. 在 memory 指令之间始终夹着 compute: hide latency with compute
+     * 1. 每个周期只放一个 global load (global -> lds)，因为 VMEM latency 极高且 LDS 本身 size 有限
+     */
     __device__ static constexpr auto HotLoopScheduler()
     {
         // schedule
@@ -407,6 +452,19 @@ struct BlockwiseGemmXdlops_pipeline_v4
     {
     }
 
+    /** @bodhi:
+     * Tail loop：做 drain / 收尾, 此时没有没有 global load，只剩 LDS + MFMA
+     * 
+     * 切成 `num_ds_write_inst` 个指令调度周期，优先发射 ds_write 释放寄存器资源等并与 ds_read 交错降低 LDS 压力，
+     * 每个指令调度周期 pipeline:
+     *   MFMA
+     *   DS write
+     *   MFMA
+     *   DS read
+     *   MFMA
+     *   DS read (bulk)
+     *   MFMA (bulk)
+     */
     template <>
     __device__ constexpr auto TailScheduler<1>()
     {

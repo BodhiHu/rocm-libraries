@@ -239,6 +239,21 @@ struct BlockwiseGemmXdlops_pipeline_base
 #endif
     }
 
+    /** @bodhi:
+     * for m_repeat in MRepeat:
+     *   for n_repeat in NRepeat:
+     *     for n in N:
+     *       for m0 in M0:
+     *         for m1 in M1:
+     *           for m2 in M2:
+     *             C[...]  // accumulate one MFMA tile
+     * 
+     *  M0: wave-level tiling
+     *  M1: lane grouping, how many lanes group together, tipically 4 or 8
+     *  M2: per-lane register fragment, usually the innermost dimension, maps to register vector layout
+     */
+
+    // @bodhi: transposed output C
     // transposed XDL output supporting C_xdl' = B_xdl' * A_xdl'
     __host__ __device__ static constexpr auto GetCThreadDescriptor_M0_N0_M1_N1_M2_N2_N3_N4()
     {
@@ -253,6 +268,7 @@ struct BlockwiseGemmXdlops_pipeline_base
             make_tuple(Number<MRepeat>{}, Number<NRepeat>{}, I1, I1, N, M0, M1, M2));
     }
 
+    // @bodhi: normal output C
     // XDL output supporting C_xdl = A_xdl * B_xdl
     __host__ __device__ static constexpr auto GetCThreadDescriptor_M0_N0_M1_N1_M2_M3_M4_N2()
     {

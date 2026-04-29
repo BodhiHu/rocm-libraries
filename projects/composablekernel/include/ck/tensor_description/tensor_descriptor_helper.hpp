@@ -90,6 +90,10 @@ __host__ __device__ constexpr auto make_naive_tensor_descriptor(const Tuple<Leng
                                                                        element_space_size};
 }
 
+/** @bodhi:
+ * Create a tightly packed, row-major layout, the strides are calculated automatically,
+ * leaving no unused space between elements.
+ */
 // Lengths... could be:
 //   1) index_t, which is known at run-time, or
 //   2) Number<>, which is known at compile-time
