@@ -254,6 +254,9 @@ struct ThreadGroupTensorSliceTransfer_DirectLoad
             src_buf.template DirectCopyToLds<remove_cvref_t<decltype(dst_buf)>, ScalarPerVector>(
                 dst_buf, src_offset, dst_offset, is_src_valid);
 
+            /** @bodhi:
+             * 判断当前维度是否还能继续走，只有当后面的维度都走到末尾，才在当前维度 move
+             */
             constexpr auto move_on_dim = [&]() constexpr {
                 StaticallyIndexedArray<bool, nDim> move_on_dim_;
 
@@ -280,7 +283,22 @@ struct ThreadGroupTensorSliceTransfer_DirectLoad
                     static_for<1, i, 1>{}([&](auto j) {
                         tmp = tmp * dst_access_lengths[j] + ordered_dst_access_idx[j];
                     });
-
+                    /** @bodhi:
+                     * 访存优化(Space-Filling Curves): "Snake or zig-zag/serpentine" patterns,
+                     * particularly effective for maintaining cache locality when moving between
+                     * rows or higher-dimensional boundaries, providing cache-friendly traversal
+                     * patterns that help maximize hardware utilization.
+                     * 
+                     *  0, 1, 2, 3
+                     *  7, 6, 5, 4
+                     *  8, 9,10,11
+                     * 15,14,13,12
+                     * 
+                     * https://rocmdocs.amd.com/projects/composable_kernel/en/latest/conceptual/ck_tile/tile_window.html#space-filling-curves-for-memory-access
+                     * 
+                     * 偶数 → forward
+                     * 奇数 → backward
+                     */
                     forward_sweep_(i) = tmp % 2 == 0;
                 });
 
