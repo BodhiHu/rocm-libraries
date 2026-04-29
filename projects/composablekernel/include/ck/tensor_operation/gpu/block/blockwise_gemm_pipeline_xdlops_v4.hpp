@@ -721,6 +721,44 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
         }
     }
 
+    /** @bodhi:
+     * __builtin_amdgcn_sched_group_barrier:
+     * 
+     * The first parameter is a mask that determines the types of instructions that
+     * you would like to synchronize around and add to a scheduling group.
+     * The second parameter is the number of matching instructions that will be associated with this sched_group_barrier.
+     * The third parameter is an identifier which is used to describe what other
+     * sched_group_barriers should be synchronized with.
+     * 
+     * This intrinsic combines multiple sched_group_barrier intrinsics enables an ordering of specific instruction types during instruction scheduling. For example, the following enforces a sequence of 1 VMEM read, followed by 1 VALU instruction, followed by 5 MFMA instructions:
+     * ```
+     *    // 1 VMEM read
+     *    sched_group_barrier::<32, 1, 0>()
+     *    // 1 VALU
+     *    sched_group_barrier::<2, 1, 0>()
+     *    // 5 MFMA
+     *    sched_group_barrier::<8, 5, 0>()
+     * ```
+     * 
+     * 和 s_waitcnt 的区别:
+     *     s_waitcnt       : 等待 memory 完成（数据依赖）
+     *     s_sched_barrier : 控制指令发射顺序
+     * 
+     * HotLoopScheduler:
+     * 
+     * 1. 把整个 hot loop 切成 num_buffer_load_inst 个“调度周期”,
+     * 每个 “调度周期” 构建一条理想的 memory/compute interleave 指令 pipeline, 比如:
+     *   MFMA
+     *   LDS read to VGPR/AGPR
+     *   MFMA
+     *   LDS write from AGPR
+     *   MFMA
+     *   VMEM load (global -> LDS)
+     *   MFMA MFMA MFMA ...
+     *
+     * 1. 在 memory 指令之间始终夹着 compute: hide latency with compute
+     * 1. 每个周期只放一个 global load (global -> lds)，因为 VMEM latency 极高且 LDS 本身 size 有限
+     */
     __device__ static constexpr void HotLoopScheduler()
     {
         // TODO: Take data type into consideration as pipe ver 3
@@ -819,23 +857,48 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
                         CThreadBuffer& c_thread_buf,
                         index_t num_loop) const
     {
+        // @bodhi: thread VGPRs that holding the a/b matrix data:
         auto a_thread_buf = make_static_buffer<AddressSpaceEnum::Vgpr, ComputeDataTypeBuf>(
             a_thread_desc_.GetElementSpaceSize());
         auto b_thread_buf = make_static_buffer<AddressSpaceEnum::Vgpr, ComputeDataTypeBuf>(
             b_thread_desc_.GetElementSpaceSize());
 
+        // @bodhi: for ping-pong buffer, on thread VGPRs:
         StaticallyIndexedArray<decltype(a_thread_buf), Number<2>{}> a_thread_bufs;
         StaticallyIndexedArray<decltype(b_thread_buf), Number<2>{}> b_thread_bufs;
 
+        // @bodhi: PING: load matrix from global memory to LDS, blockwise:
         // Global prefetch 1
         a_blockwise_copy.Run(a_grid_desc, a_grid_buf, a_block_desc, a_block_buf.At(I0));
         b_blockwise_copy.Run(b_grid_desc, b_grid_buf, b_block_desc, b_block_buf.At(I0));
 
+        // @bodhi: move slice window by one block-copy-step:
         a_blockwise_copy.MoveSrcSliceWindow(a_grid_desc, a_block_copy_step);
         b_blockwise_copy.MoveSrcSliceWindow(b_grid_desc, b_block_copy_step);
 
+        /** @bodhi:
+         * block_sync_lds_direct_load:
+         * 
+         * 0 means wait for all vm/lgkm ops complete
+         * 
+         * #ifdef __gfx12__
+         *     asm volatile("\
+         *     s_wait_loadcnt 0x0 \n \
+         *     s_wait_dscnt 0x0 \n \
+         *     s_barrier_signal -1 \n \
+         *     s_barrier_wait -1 \
+         *     " ::);
+         * #else
+         *     asm volatile("\
+         *     s_waitcnt vmcnt(0) \n \
+         *     s_waitcnt lgkmcnt(0) \n \
+         *     s_barrier \
+         *     " ::);
+         * #endif
+         */
         block_sync_lds_direct_load();
 
+        // @bodhi: PING: load a/b block LDS data to thread VGPRs:
         // Local prefetch 1
         static_for<0, KRepeat, 1>{}([&](auto k) {
             static_for<0, MRepeat, 1>{}([&](auto m0) {
@@ -856,6 +919,7 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
             });
         });
 
+        // @bodhi: PONG: load matrix from global memory to LDS, blockwise:
         // Global prefetch 2
         a_blockwise_copy.Run(a_grid_desc, a_grid_buf, a_block_desc, a_block_buf.At(I1));
         b_blockwise_copy.Run(b_grid_desc, b_grid_buf, b_block_desc, b_block_buf.At(I1));
@@ -879,6 +943,7 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
                                     auto mfma_reg_buf) {
                     block_sync_lds_direct_load();
 
+                    // @bodhi: load a/b block LDS data to thread VGPRs:
                     static_for<0, KRepeat, 1>{}([&](auto k) {
                         static_for<0, MRepeat, 1>{}([&](auto m0) {
                             a_thread_copy_.Run(a_block_desc_m0_m1_m2_k,
@@ -898,6 +963,7 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
                         });
                     });
 
+                    // @bodhi: load matrix from global memory to LDS, blockwise:
                     a_blockwise_copy.Run(
                         a_grid_desc, a_grid_buf, a_block_desc, a_block_buf.At(lds_write_buf));
                     b_blockwise_copy.Run(
@@ -906,6 +972,17 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
                     a_blockwise_copy.MoveSrcSliceWindow(a_grid_desc, a_block_copy_step);
                     b_blockwise_copy.MoveSrcSliceWindow(b_grid_desc, b_block_copy_step);
 
+                    /** @bodhi:
+                     * Emit KRepeat*MRepeat*NRepeat xdl gemm ops, statically unroll during compile time:
+                     * 
+                     * first need to convert to vectorized a/b thread data, then feed to xdlops_gemm:
+                     * 
+                     * for example:
+                     *     using half16_t = typename vector_type<half_t, 16>::type;         // pack 16 fp16
+                     *     using f8x4_fnuz_t  = typename vector_type<f8_fnuz_t, 4>::type;   // pack  4 fp8
+                     *     using f8x8_fnuz_t  = typename vector_type<f8_fnuz_t, 8>::type;   // pack  8 fp8
+                     *     using f8x16_fnuz_t = typename vector_type<f8_fnuz_t, 16>::type;  // pack 16 fp8
+                     */
                     static_ford<Sequence<KRepeat, MRepeat, NRepeat>>{}([&](auto kmn) {
                         constexpr auto k0 = Number<kmn[Number<0>{}]>{};
                         constexpr auto m0 = Number<kmn[Number<1>{}]>{};
@@ -933,10 +1010,13 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
                                         c_thread_buf.GetVectorTypeReference(Number<c_offset>{}));
                     });
 
+                    // @bodhi: 构建一条理想的 memory/compute interleave 指令 pipeline, hide latency with compute 
                     HotLoopScheduler();
                 };
 
+                // @bodhi: read LDS 1, write LDS 0
                 LoopFunc(I1, I1, I0, I0);
+                // @bodhi: read LDS 0, write LDS 1
                 LoopFunc(I0, I0, I1, I1);
 
                 i += HotloopUnroll;

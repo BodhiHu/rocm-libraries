@@ -1639,6 +1639,7 @@ struct GridwiseGemmMultiD_xdl_cshuffle_v3
             MakeCGridDescriptor_MBlock_MPerBlock_NBlock_NPerBlock(
                 c_grid_desc_m_n, problem.MBlock, problem.NBlock);
 
+        // @bodhi: the a/b tensor data on global memory, gridwise
         const auto a_grid_buf = make_dynamic_buffer<AddressSpaceEnum::Global>(
             p_a_grid, a_grid_desc_ak0_m_ak1.GetElementSpaceSize());
         const auto b_grid_buf = make_dynamic_buffer<AddressSpaceEnum::Global>(
@@ -1787,12 +1788,15 @@ struct GridwiseGemmMultiD_xdl_cshuffle_v3
             }
         };
 
+        // @bodhi: create a/b blockwise global->lds copy wrapper:
         auto a_blockwise_copy = get_a_blockwise_copy();
         auto b_blockwise_copy = get_b_blockwise_copy();
 
         // LDS allocation for A and B: be careful of alignment
         constexpr auto a_block_space_size_aligned = math::integer_least_multiple(
             a_block_desc_ak0_m_ak1.GetElementSpaceSize(), max_lds_align);
+
+        // @bodhi: create a/b block ping-pong LDS buffers:
 
         auto a_block_buf_ping = make_dynamic_buffer<AddressSpaceEnum::Lds>(
             static_cast<LDSTypeA*>(p_shared_0), a_block_desc_ak0_m_ak1.GetElementSpaceSize());
@@ -1810,9 +1814,11 @@ struct GridwiseGemmMultiD_xdl_cshuffle_v3
                 a_block_space_size_aligned * sizeof(LDSTypeA) / sizeof(LDSTypeB),
             b_block_desc_bk0_n_bk1.GetElementSpaceSize());
 
+        // @bodhi: a/b ping-pong block LDS bufs:
         auto a_block_bufs = make_tuple(a_block_buf_ping, a_block_buf_pong);
         auto b_block_bufs = make_tuple(b_block_buf_ping, b_block_buf_pong);
 
+        // @bodhi: a/b block slice copy 步长：
         constexpr auto a_block_slice_copy_step = make_multi_index(KPerBlock / AK1Number, 0, 0);
         constexpr auto b_block_slice_copy_step = make_multi_index(KPerBlock / BK1Number, 0, 0);
 
