@@ -1384,6 +1384,9 @@ struct GridwiseGemm_xdl_cshuffle_base
                           NXdlPerWave % CShuffleNXdlPerWavePerShuffle == 0,
                       "wrong!");
 
+        /** @bodhi: do elementwise op before CShuffle or after
+         *  elementwise op example: alpha*AB + beta*C
+         */
         tensor_operation::element_wise::PassThrough pass_through{};
         const auto& vpgr_to_lds_element_op = [&] {
             if constexpr(DoElementwiseBeforeCShuffle)
@@ -1409,6 +1412,7 @@ struct GridwiseGemm_xdl_cshuffle_base
         auto c_grid_buf = make_dynamic_buffer<AddressSpaceEnum::Global>(
             p_c_grid, c_grid_desc_mblock_mperblock_nblock_nperblock.GetElementSpaceSize());
 
+        // @bodhi: how many waves along BLOCK_M/N dimension in block:
         constexpr index_t MWave = MPerBlock / (MXdlPerWave * MPerXdl);
         constexpr index_t NWave = NPerBlock / (NXdlPerWave * NPerXdl);
         constexpr auto c_shuffle_block_desc_mblock_mperblock_nblock_nperblock =
@@ -1594,6 +1598,9 @@ struct GridwiseGemm_xdl_cshuffle_base
             // make sure it's safe to write to LDS
             block_sync_lds();
 
+            /** @bodhi:
+             * copy(shuffle) thread VGPR results to LDS:
+             */
             // each thread write its data from VGPR to LDS
             c_thread_copy_vgpr_to_lds.Run(c_thread_desc,
                                           sfc_c_vgpr.GetIndexTupleOfNumber(access_id),
@@ -1604,6 +1611,10 @@ struct GridwiseGemm_xdl_cshuffle_base
             // make sure it's safe to read from LDS
             block_sync_lds();
 
+            /** @bodhi:
+             * copy block results from LDS to global:
+             * this uses `__builtin_amdgcn_raw_buffer_store_b{32|64|128}` .etc
+             */
             // each block copy its data from LDS to global
             cde_block_copy_lds_and_global.Run(c_ds_desc_refs,
                                               c_ds_buf_refs,

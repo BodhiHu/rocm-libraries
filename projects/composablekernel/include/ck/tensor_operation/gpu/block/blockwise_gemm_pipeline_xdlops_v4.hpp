@@ -930,6 +930,8 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
         // Initialize C
         c_thread_buf.Clear();
 
+        // @bodhi: the main loop
+
         // main body
         if constexpr(HasMainLoop)
         {
@@ -943,7 +945,7 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
                                     auto mfma_reg_buf) {
                     block_sync_lds_direct_load();
 
-                    // @bodhi: load a/b block LDS data to thread VGPRs:
+                    // @bodhi: read a/b block LDS data to thread VGPRs:
                     static_for<0, KRepeat, 1>{}([&](auto k) {
                         static_for<0, MRepeat, 1>{}([&](auto m0) {
                             a_thread_copy_.Run(a_block_desc_m0_m1_m2_k,
@@ -963,7 +965,7 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
                         });
                     });
 
-                    // @bodhi: load matrix from global memory to LDS, blockwise:
+                    // @bodhi: write matrix from global memory to LDS, blockwise:
                     a_blockwise_copy.Run(
                         a_grid_desc, a_grid_buf, a_block_desc, a_block_buf.At(lds_write_buf));
                     b_blockwise_copy.Run(
@@ -1014,6 +1016,8 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
                     HotLoopScheduler();
                 };
 
+                // @bodhi: PING-PONG schedule:
+
                 // @bodhi: read LDS 1, write LDS 0
                 LoopFunc(I1, I1, I0, I0);
                 // @bodhi: read LDS 0, write LDS 1
@@ -1023,10 +1027,12 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
             } while(i < (num_loop - PrefetchStages));
         }
 
+        // @bodhi: read+write+compute
         auto ReadWriteCompFunc =
             [&](auto lds_read_buf, auto lds_read_reg_buf, auto lds_write_buf, auto mfma_reg_buf) {
                 block_sync_lds_direct_load();
 
+                // @bodhi: read a/b block LDS data to thread VGPRs:
                 static_for<0, KRepeat, 1>{}([&](auto k) {
                     static_for<0, MRepeat, 1>{}([&](auto m0) {
                         a_thread_copy_.Run(a_block_desc_m0_m1_m2_k,
@@ -1046,11 +1052,23 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
                     });
                 });
 
+                // @bodhi: write matrix from global memory to LDS, blockwise:
                 a_blockwise_copy.Run(
                     a_grid_desc, a_grid_buf, a_block_desc, a_block_buf.At(lds_write_buf));
                 b_blockwise_copy.Run(
                     b_grid_desc, b_grid_buf, b_block_desc, b_block_buf.At(lds_write_buf));
 
+                /** @bodhi:
+                 * Emit KRepeat*MRepeat*NRepeat xdl gemm ops, statically unroll during compile time:
+                 * 
+                 * first need to convert to vectorized a/b thread data, then feed to xdlops_gemm:
+                 * 
+                 * for example:
+                 *     using half16_t = typename vector_type<half_t, 16>::type;         // pack 16 fp16
+                 *     using f8x4_fnuz_t  = typename vector_type<f8_fnuz_t, 4>::type;   // pack  4 fp8
+                 *     using f8x8_fnuz_t  = typename vector_type<f8_fnuz_t, 8>::type;   // pack  8 fp8
+                 *     using f8x16_fnuz_t = typename vector_type<f8_fnuz_t, 16>::type;  // pack 16 fp8
+                 */
                 static_ford<Sequence<KRepeat, MRepeat, NRepeat>>{}([&](auto kmn) {
                     constexpr auto k0 = Number<kmn[Number<0>{}]>{};
                     constexpr auto m0 = Number<kmn[Number<1>{}]>{};
@@ -1081,6 +1099,7 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
                 HotLoopScheduler();
             };
 
+        // @bodhi: read+compute
         auto ReadCompFunc = [&](auto lds_read_buf, auto lds_read_reg_buf, auto mfma_reg_buf) {
             block_sync_lds_direct_load();
 
@@ -1132,6 +1151,7 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
             HotLoopScheduler();
         };
 
+        // @bodhi: just compute
         auto CompFunc = [&](auto mfma_reg_buf) {
             static_ford<Sequence<KRepeat, MRepeat, NRepeat>>{}([&](auto kmn) {
                 constexpr auto k0 = Number<kmn[Number<0>{}]>{};
@@ -1159,15 +1179,24 @@ struct BlockwiseGemmXdlopsDirectLoad_pipeline_v4<BlockGemmPipelineScheduler::Int
                                 c_thread_buf.GetVectorTypeReference(Number<c_offset>{}));
             });
         };
+        // @bodhi: the tail
         // tail
         if constexpr(TailNum == TailNumber::Odd)
         {
+            /** @bodhi: 奇数末端，相对偶数多了一轮 interleaved lds_read + lds_write + compute
+             */
             ReadWriteCompFunc(I1, I1, I0, I0);
+            // @bodhi: 最后一轮 interleaved lds_read + compute
             ReadCompFunc(I0, I0, I1);
+            // @bodhi: 对最后一次 lds_read 的数据做 xdl compute
             CompFunc(I0);
         }
         else if constexpr(TailNum == TailNumber::Even)
         {
+            /** @bodhi: 偶数末端:
+             * 最后一轮 interleaved lds_read + compute，
+             * 然后对最后一次 lds_read 的数据做 xdl compute
+             */
             ReadCompFunc(I1, I1, I0);
             CompFunc(I1);
         }

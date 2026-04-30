@@ -1639,12 +1639,13 @@ struct GridwiseGemmMultiD_xdl_cshuffle_v3
             MakeCGridDescriptor_MBlock_MPerBlock_NBlock_NPerBlock(
                 c_grid_desc_m_n, problem.MBlock, problem.NBlock);
 
-        // @bodhi: the a/b tensor data on global memory, gridwise
+        // @bodhi: the a/b tensor data descriptor on global memory, gridwise
         const auto a_grid_buf = make_dynamic_buffer<AddressSpaceEnum::Global>(
             p_a_grid, a_grid_desc_ak0_m_ak1.GetElementSpaceSize());
         const auto b_grid_buf = make_dynamic_buffer<AddressSpaceEnum::Global>(
             p_b_grid, b_grid_desc_bk0_n_bk1.GetElementSpaceSize());
 
+        // @bodhi: calculate the 2-dimensional index from the 1d idx (blockIdx.x)
         const auto block_work_idx =
             block_2_ctile_map.CalculateBottomIndex(make_multi_index(get_block_1d_id()));
 
@@ -1656,6 +1657,7 @@ struct GridwiseGemmMultiD_xdl_cshuffle_v3
             return;
         }
 
+        // @bodhi: read block m/n idx from first lane, and broadcast to the rest lanes 
         const index_t block_m_id = __builtin_amdgcn_readfirstlane(block_work_idx[I0]);
         const index_t block_n_id = __builtin_amdgcn_readfirstlane(block_work_idx[I1]);
 
@@ -1666,6 +1668,11 @@ struct GridwiseGemmMultiD_xdl_cshuffle_v3
         const index_t n_block_data_idx_on_grid =
             __builtin_amdgcn_readfirstlane(block_n_id * NPerBlock);
 
+        /** @bodhi:
+         * 找到 AK1/BK1 的最大 LDS alignment，即 最小公倍数
+         * AK1 → vector width when loading A tile into LDS
+         * BK1 → vector width when loading B tile into LDS
+         */
         // lds max alignment
         constexpr auto max_lds_align = math::lcm(AK1Number, BK1Number);
 
@@ -1676,6 +1683,8 @@ struct GridwiseGemmMultiD_xdl_cshuffle_v3
         // B matrix in LDS memory, dst of blockwise copy
         constexpr auto b_block_desc_bk0_n_bk1 =
             GetBBlockDescriptor_BK0PerBlock_NPerBlock_BK1(get_device_arch());
+
+        // @bodhi: create a/b blockwise data copy runners
 
         auto get_a_blockwise_copy = [&]() {
             if constexpr(DirectLoad)
@@ -1818,9 +1827,11 @@ struct GridwiseGemmMultiD_xdl_cshuffle_v3
         auto a_block_bufs = make_tuple(a_block_buf_ping, a_block_buf_pong);
         auto b_block_bufs = make_tuple(b_block_buf_ping, b_block_buf_pong);
 
-        // @bodhi: a/b block slice copy 步长：
+        // @bodhi: a/b block slice copy step：
         constexpr auto a_block_slice_copy_step = make_multi_index(KPerBlock / AK1Number, 0, 0);
         constexpr auto b_block_slice_copy_step = make_multi_index(KPerBlock / BK1Number, 0, 0);
+
+        // @bodhi: schdule blockwise GEMM pipeline, see BlockwiseGemmXdlopsDirectLoad_pipeline_v4
 
         // Blockwise GEMM pipeline
         static_assert(std::is_default_constructible_v<BlockwiseGemmPipe>);
@@ -1845,6 +1856,13 @@ struct GridwiseGemmMultiD_xdl_cshuffle_v3
                                                                          b_block_slice_copy_step,
                                                                          c_thread_buf,
                                                                          num_k_block_main_loop);
+
+        /** @bodhi:
+         * run elementwise epilogue / shuffle the result C in LDS,
+         * and write to global memory.
+         * 
+         * see GridwiseGemm_xdl_cshuffle_base::RunMultiDEpilogue
+         */
 
         // shuffle C and write out
         const auto ds_grid_desc_mblock_mperblock_nblock_nperblock =

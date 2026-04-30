@@ -104,6 +104,8 @@ struct ThreadwiseTensorSliceTransfer_v1r3
         static_for<0, num_access, 1>{}([&](auto idx_1d) {
             constexpr auto idx_md = SpaceFillingCurve::GetIndex(idx_1d);
 
+            // @bodhi: copy data from src_buf into dst_vector
+
             // copy data from src_buf into dst_vector
             // TODO: It's a hack here to use \p dst_scalar_step_in_vector. Use SpaceFillingCurve?
             static_for<0, DstScalarPerVector, 1>{}([&](auto i) {
@@ -120,6 +122,8 @@ struct ThreadwiseTensorSliceTransfer_v1r3
 
             const bool is_dst_valid =
                 coordinate_has_valid_offset_assuming_visible_index_is_valid(dst_desc, dst_coord_);
+
+            // @bodhi: copy data from dst_vector into dst_buf
 
             // copy data from dst_vector into dst_buf
             dst_buf.template Update<DstInMemOp, dst_vector_t>(
