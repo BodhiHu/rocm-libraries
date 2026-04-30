@@ -1600,6 +1600,18 @@ struct GridwiseGemm_xdl_cshuffle_base
 
             /** @bodhi:
              * copy(shuffle) thread VGPR results to LDS:
+             * 參考 ISA 文檔，因爲 AMDGPU WFMA/WMMA 結果矩陣在 K 維度沿著 Lane0~63 VGPR/AGPR 連續排放，
+             * 所以可以天然避免 bank 衝突，以 ds_write_b128 爲例：
+             * 
+             *  ○ ds_write_b128，wave64, 8 lane per group, 8 phases:
+             *    ■ lane0~lane7
+             *    ■ lane8~lane15
+             *    ■ lane16~lane23
+             *    ■ lane24~lane31
+             *    ■ lane32~lane39
+             *    ■ lane40~lane47
+             *    ■ lane48~lane55
+             *    ■ lane56~lane63
              */
             // each thread write its data from VGPR to LDS
             c_thread_copy_vgpr_to_lds.Run(c_thread_desc,
