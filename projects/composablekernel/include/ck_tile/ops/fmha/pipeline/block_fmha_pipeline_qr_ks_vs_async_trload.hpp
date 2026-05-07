@@ -168,12 +168,17 @@ struct BlockFmhaPipelineQRKSVSAsyncTrload
                       "wrong!");
         ignore = bias_dram_block_window_tmp;
         ignore = position_encoding;
+
+        // @bodhi: 编译阶段选择 QK, PV BlockGemm 模板:
+
         // Block GEMM
         constexpr auto gemm_0 = Policy::template GetQKBlockGemm<Problem>();
         constexpr auto gemm_1 = Policy::template GetPVBlockGemm<Problem>();
 
         using SaccBlockTileType = decltype(gemm_0.MakeCBlockTile());
         auto s_acc              = SaccBlockTileType{};
+
+        // @bodhi: softmax reduction functions:
 
         // reduction function for softmax
         const auto f_max = [](auto e0, auto e1) { return max(e0, e1); };
@@ -189,6 +194,7 @@ struct BlockFmhaPipelineQRKSVSAsyncTrload
         using MLBlockTileType = decltype(block_tile_reduce<SMPLComputeDataType>(
             SBlockTileType{}, sequence<1>{}, f_max, SMPLComputeDataType{0}));
 
+        // @bodhi: 初始化 m, l:
         // init M, L
         auto m = MLBlockTileType{};
         auto l = MLBlockTileType{};
@@ -237,6 +243,8 @@ struct BlockFmhaPipelineQRKSVSAsyncTrload
                 return o_acc;
             }
         }
+
+        // @bodhi: load Q/K/V tiles to LDS using direct load:
 
         // Q tile in LDS
         auto q_dram_window = make_tile_window(
@@ -351,6 +359,14 @@ struct BlockFmhaPipelineQRKSVSAsyncTrload
         constexpr index_t k_vmem_insts = k_dram_window.get_num_of_access();
         constexpr index_t v_vmem_insts = v_dram_window.get_num_of_access();
 
+        /** @bodhi:
+         * 沿着 block m/n 维度循环执行 Blockwise FA pipeline:
+         *   async direct load Q/K/V
+         *   using double buffer for
+         *     S = Q*K_t 
+         *     P = online_softmax(S)
+         *     O = P*V
+         */
         do
         {
             block_sync_lds();
@@ -358,6 +374,12 @@ struct BlockFmhaPipelineQRKSVSAsyncTrload
 
             // move V tile windows
             move_tile_window(v_dram_window, {kN0, 0});
+
+            /** @bodhi:
+             * 计算 QK gemm:
+             * S = Q*K_t
+             * k0_loops = kQKHeaddim / kK0
+             */
 
             // STAGE 1, QK gemm
             clear_tile(s_acc); // initialize C
@@ -451,6 +473,11 @@ struct BlockFmhaPipelineQRKSVSAsyncTrload
 
             block_sync_lds();
             async_load_tile(k_lds_write_window, k_dram_window);
+
+            /** @bodhi:
+             * 对 S 做 online softmax, 同时更新 m, l, 得到 P:
+             *  P = Softmax(S)
+             */
 
             // Gemm1
             auto s_new = [&]() {
@@ -569,6 +596,9 @@ struct BlockFmhaPipelineQRKSVSAsyncTrload
 
             block_sync_lds_direct_load<k_vmem_insts>();
 
+            /** @bodhi:
+             * 计算 O = P*V
+             */
             auto v_tile = load_tile_transpose(v_lds_read_window);
 
             if constexpr(1 < k1_loops)

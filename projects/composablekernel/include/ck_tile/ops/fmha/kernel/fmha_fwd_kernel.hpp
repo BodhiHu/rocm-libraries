@@ -24,6 +24,13 @@
 #endif
 #endif
 
+/**
+ * @bodhi:
+ *   Q shape: [B, H, Sq, D]
+ *   K shape: [B, H, Sk, D]
+ *   V shape: [B, H, Sk, Dv]
+ */
+
 // S[seqlen_q, seqlen_k] = Q[seqlen_q, hdim_q] @ K[seqlen_k, hdim_q]
 // S'[seqlen_q, seqlen_k] = S[seqlen_q, seqlen_k] * Scale[1]
 // S''[seqlen_q, seqlen_k] = S'[seqlen_q, seqlen_k] + Bias[seqlen_q, seqlen_k]
@@ -126,6 +133,16 @@ struct FmhaFwdKernel
         ck_tile::index_t head_start       = 0;
     };
 
+    /** @bodhi:
+     * softcap: apply a soft limit/clipping to attention logits before softmax, preventing logits from growing excessively large.
+     * used in used in Gemma2/Grok-1 .etc.
+     * common formulation:
+     *   x_capped = c * tanh(x/c)
+     * 
+     * Effects:
+     *   small values → almost unchanged
+     *   huge values  → smoothly saturated to ±c
+     */
     struct FmhaFwdLogitsSoftCapKargs
     {
         FmhaFwdLogitsSoftCapKargs() = default;
@@ -160,6 +177,19 @@ struct FmhaFwdKernel
         ck_tile::index_t batch_stride_bias = 0;
     };
 
+    /** @bodhi:
+     * ALiBi: handle input(inference) sequences longer than the training max context length, by adding a bias, used in BLOOM/MPT
+     * Another solution is RoPE, used more common in LLaMA .etc.
+     * 
+     * ```py
+     *   alibi_bias = generate_alibi_bias() # [num_heads]
+     * 
+     *   def alibi(score, b, h, q_idx, kv_idx):
+     *       bias = alibi_bias[h] * (kv_idx - q_idx)
+     *       return score + bias
+     * ```
+     */
+
     struct FmhaFwdAlibiKargs
     {
         // alibi is batch*nhead*1, no matter in batch/group mode, they are the same
@@ -174,6 +204,20 @@ struct FmhaFwdKernel
         ck_tile::GenericAttentionMaskEnum mask_type;
     };
 
+    /** @bodhi:
+     * de-scaling factors:
+     *   // x_fp8​ = round(x/s)
+     *   // x     ≈ x_fp8​×s
+     *   float q = fp8_q * q_descale;
+     *   float k = fp8_k * k_descale;
+     *   float v = fp8_v * v_descale;
+     * 
+     * common scaling strategies:
+     *   per-tensor
+     *   per-head
+     *   per-block
+     *   per-row
+     */
     struct FmhaFwdCommonQScaleKargs
     {
         const void* q_descale_ptr = nullptr;
@@ -234,6 +278,10 @@ struct FmhaFwdKernel
         ck_tile::index_t batch_stride_lse = 0;
     };
 
+    /** @bodhi:
+     * Apply dropout mask after Softmax.
+     * The dropout operation randomly zeros some attention logits(P).
+     */
     struct FmhaFwdDropoutSeedOffset
     {
         template <typename T>
@@ -1255,6 +1303,13 @@ struct FmhaFwdKernel
             head_start);
     }
 
+    /** @bodhi:
+     * kernel grid:
+     *  if has_padded_seqlen_k:
+     *    (n_head, batch, seqlen_q/kM0 * head_dim_v/kN1)
+     *  else:
+     *    (n_head, seqlen_q/kM0 * head_dim_v/kN1, batch)
+     */
     CK_TILE_HOST static constexpr auto GridSize(ck_tile::index_t batch_size_,
                                                 ck_tile::index_t nhead_,
                                                 ck_tile::index_t seqlen_q_,
@@ -1280,6 +1335,11 @@ struct FmhaFwdKernel
         }
     }
 
+    /**
+     * @bodhi: calculate the m/n/head/batch indexes based on the Grid:
+     * 
+     *   returns (i_tile_m, i_tile_n, i_nhead, i_batch)
+     */
     CK_TILE_DEVICE static constexpr auto GetTileIndex(const Kargs& kargs)
     {
         bool has_padded_seqlen_k = false;
@@ -1424,6 +1484,8 @@ struct FmhaFwdKernel
         {
             // allocate LDS
             __shared__ char smem_ptr[GetSmemSize()];
+
+            // @bodhi: get block_m/block_n start index:
             // divide problem
             const auto [i_tile_m, i_tile_n, i_nhead, i_batch] = GetTileIndex(kargs);
             const index_t i_m0 = amd_wave_read_first_lane(i_tile_m * FmhaPipeline::kM0);
@@ -1444,7 +1506,8 @@ struct FmhaFwdKernel
                     ? (*(static_cast<const float*>(kargs.sink_ptr) + i_nhead)) / kargs.scale_s
                     : -numeric<float>::infinity();
 
-            if constexpr(kIsGroupMode)
+            // @bodhi: 计算 batch_offset_q/k/v，如果是 Group 模式(MQA/GQA)，则提前计算好每 batch 的 q/k seqstart: 
+            if constexpr(kIsGroupMode) // @bodhi: Group Mode: MQA/GQA
             {
                 // Use seqstart_q_ptr and seqstart_k_ptr for physical starts
                 const long_index_t query_start = kargs.seqstart_q_ptr[i_batch];
@@ -1583,6 +1646,7 @@ struct FmhaFwdKernel
             // for simplicity, batch stride we just modify the pointer
             const index_t i_nhead_k = i_nhead / kargs.nhead_ratio_qk;
 
+            // @bodhi: 计算当前 Block 的 Q/K/V/O pointer:
             const QDataType* q_ptr =
                 reinterpret_cast<const QDataType*>(kargs.q_ptr) +
                 (static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_q + batch_offset_q) /
@@ -1599,6 +1663,7 @@ struct FmhaFwdKernel
                                static_cast<long_index_t>(i_nhead) * kargs.nhead_stride_o +
                                batch_offset_o;
 
+            // @bodhi: 创建 blockwise 的 Q/K/V Tensor view：
             // Q/K/V DRAM and DRAM window
             const auto q_dram = [&]() {
                 const auto q_dram_naive = make_naive_tensor_view<address_space_enum::global>(
@@ -1895,6 +1960,10 @@ struct FmhaFwdKernel
             auto o_acc_tile = [&, i_nhead_ = i_nhead, i_nhead_k_ = i_nhead_k]() {
                 if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::PERTENSOR)
                 {
+                    /**
+                     * @bodhi: 计算 P, O scale factors:
+                     */
+
                     // TODO - move global load of descale to pipeline
                     float v_descale = *(reinterpret_cast<const float*>(kargs.v_descale_ptr));
 
@@ -2148,6 +2217,7 @@ struct FmhaFwdKernel
                 }
             }();
 
+            // @bodhi: O TensorView, blockwise
             // O DRAM and O DRAM window
             auto o_dram = [&]() {
                 const auto o_dram_naive = make_naive_tensor_view<address_space_enum::global>(
@@ -2163,11 +2233,13 @@ struct FmhaFwdKernel
                     sequence<kPadSeqLenQ, kPadHeadDimV>{});
             }();
 
+            // @bodhi: O Tensor window, tilewise
             auto o_dram_window = make_tile_window(
                 o_dram,
                 make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kN1>{}),
                 {i_m0, i_n1});
 
+            // @bodhi: run FMHA Pipeline:
             EpiloguePipeline{}(o_dram_window, o_acc_tile, nullptr);
         }
         else
@@ -2892,6 +2964,7 @@ struct FmhaFwdKernel
                 make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kN1>{}),
                 {i_m0, i_n1});
 
+            // @bodhi: run the FmhaPipeline and Epilogue:
             EpiloguePipeline{}(o_dram_window, o_acc_tile, nullptr);
         }
     }
